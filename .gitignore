@@ -1,0 +1,19 @@
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/*.tfvars
+terraform/crash.log
+
+# Secrets / personal data
+.env
+master_cv.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Misc
+.DS_Store
+response.json

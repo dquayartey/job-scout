@@ -1,0 +1,4 @@
+google-genai
+boto3
+requests
+aws-lambda-ric

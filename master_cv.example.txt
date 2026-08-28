@@ -1,0 +1,13 @@
+[Replace this with your real CV as plain text before uploading.]
+
+Name: David
+Role: Software Developer / Cloud & DevOps Engineer
+
+Skills: AWS (Lambda, SAM, S3, DynamoDB, ECR, CloudFront, Cognito, API Gateway),
+CI/CD (GitHub Actions), Docker, Python, algorithmic trading systems, cybersecurity assessment tooling.
+
+Experience:
+- [Add your roles, projects, and achievements here]
+
+Certifications:
+- [Add any AWS/cloud certifications here]
