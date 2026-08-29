@@ -65,7 +65,7 @@ variable "schedule_expression" {
 variable "lambda_memory_mb" {
   description = "Lambda memory allocation in MB"
   type        = number
-  default     = 512
+  default     = 256
 }
 
 variable "lambda_timeout_s" {
