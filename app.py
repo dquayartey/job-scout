@@ -23,6 +23,7 @@ SES_SENDER = os.environ["SES_SENDER"]
 SES_RECIPIENT = os.environ["SES_RECIPIENT"]
 MATCH_THRESHOLD = int(os.environ.get("MATCH_THRESHOLD", "7"))
 SEEN_TTL_DAYS = int(os.environ.get("SEEN_TTL_DAYS", "30"))
+MAX_SCORE_ATTEMPTS = int(os.environ.get("MAX_SCORE_ATTEMPTS", "3"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 CV_LINK_EXPIRY_S = int(os.environ.get("CV_LINK_EXPIRY_S", str(7 * 24 * 3600)))  # 7 days
 
@@ -367,17 +368,37 @@ def fetch_jobs():
     return dedup(filtered)
 
 
-def already_seen(job_id):
-    item = ddb.get_item(Key={"job_id": job_id}).get("Item")
-    return item is not None
+def _get_seen_item(job_id):
+    return ddb.get_item(Key={"job_id": job_id}).get("Item")
 
 
-def mark_seen(job_id):
+def should_skip(job_id):
+    """A job is skipped only once it has either already matched (no reason
+    to rescore something already surfaced) or has been scored
+    MAX_SCORE_ATTEMPTS times without matching. LLM scoring has some
+    run-to-run variance, so a single unlucky score shouldn't permanently
+    bury a job that might score above threshold on a later attempt."""
+    item = _get_seen_item(job_id)
+    if item is None:
+        return False
+    if item.get("matched"):
+        return True
+    return item.get("attempts", 0) >= MAX_SCORE_ATTEMPTS
+
+
+def record_attempt(job_id, matched):
+    """Increment this job's attempt count and record whether it matched.
+    Returns the new attempt count (used for logging)."""
+    item = _get_seen_item(job_id)
+    attempts = (item.get("attempts", 0) if item else 0) + 1
     ddb.put_item(Item={
         "job_id": job_id,
+        "attempts": attempts,
+        "matched": matched,
         "seen_at": int(time.time()),
         "ttl": int(time.time()) + SEEN_TTL_DAYS * 86400,
     })
+    return attempts
 
 
 def get_master_cv():
@@ -527,23 +548,37 @@ def handler(event, context):
     jobs = fetch_jobs()
     matches = []
     failed_count = 0
+    no_match_count = 0
+    skipped_max_attempts = 0
 
     for job in jobs:
         job_id = job["id"]
-        if already_seen(job_id):
+        if should_skip(job_id):
+            item = _get_seen_item(job_id)
+            if item and not item.get("matched") and item.get("attempts", 0) >= MAX_SCORE_ATTEMPTS:
+                skipped_max_attempts += 1
             continue
 
         try:
             result = score_job(master_cv, job)
         except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
-            # Don't mark_seen — leave it unscored so it's retried next run
+            # Don't record_attempt — leave it unscored so it's retried next run.
+            # Transient failures shouldn't burn one of the job's limited attempts.
             logger.error(f"Skipping job {job_id} after scoring failure: {e}")
             failed_count += 1
             continue
 
-        mark_seen(job_id)  # mark regardless of score so we never re-score it
+        score = result.get("match_score", 0)
+        reasoning = result.get("reasoning", "")
+        matched = score >= MATCH_THRESHOLD
+        attempts = record_attempt(job_id, matched)
 
-        if result.get("match_score", 0) >= MATCH_THRESHOLD:
+        if matched:
+            logger.info(
+                f"MATCH job_id={job_id} title={job['title']!r} "
+                f"company={job['company']!r} score={score} attempt={attempts} "
+                f"reasoning={reasoning!r}"
+            )
             try:
                 tailored = tailor_cv(master_cv, job)
                 cv_key = store_tailored_cv(job_id, tailored)
@@ -551,16 +586,25 @@ def handler(event, context):
                     "title": job["title"],
                     "company": job["company"],
                     "score": result["match_score"],
-                    "reasoning": result.get("reasoning", ""),
+                    "reasoning": reasoning,
                     "url": job["url"],
                     "cv_key": cv_key,
                     "match_tier": job["match_tier"],
                 })
             except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
-                # Job was already scored and marked seen — a tailoring
+                # Job was already scored and recorded as matched — a tailoring
                 # failure just means no tailored CV/digest entry this run
                 logger.error(f"CV tailoring failed for job {job_id}: {e}")
                 failed_count += 1
+        else:
+            no_match_count += 1
+            logger.info(
+                f"NO MATCH job_id={job_id} title={job['title']!r} "
+                f"company={job['company']!r} source={job['source']} "
+                f"seniority={job['seniority']} match_tier={job['match_tier']} "
+                f"score={score} threshold={MATCH_THRESHOLD} "
+                f"attempt={attempts}/{MAX_SCORE_ATTEMPTS} reasoning={reasoning!r}"
+            )
 
     send_digest(matches, failed_count)
 
@@ -569,6 +613,8 @@ def handler(event, context):
         "body": json.dumps({
             "jobs_checked": len(jobs),
             "new_matches": len(matches),
+            "no_match": no_match_count,
+            "skipped_max_attempts": skipped_max_attempts,
             "failed": failed_count,
         }),
     }
