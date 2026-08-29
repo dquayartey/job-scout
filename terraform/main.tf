@@ -133,7 +133,7 @@ resource "aws_lambda_function" "job_scout" {
 
   environment {
     variables = {
-      GEMINI_API_KEY = var.gemini_api_key
+      GROQ_API_KEY = var.groq_api_key
       ADZUNA_APP_ID  = var.adzuna_app_id
       ADZUNA_APP_KEY = var.adzuna_app_key
       DDB_TABLE      = aws_dynamodb_table.seen_jobs.name

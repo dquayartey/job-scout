@@ -82,7 +82,7 @@ jobs:
         run: |
           terraform apply -auto-approve -input=false \
             -target=aws_ecr_repository.job_scout \
-            -var="gemini_api_key=${{ secrets.GEMINI_API_KEY }}" \
+            -var="groq_api_key=${{ secrets.GROQ_API_KEY }}" \
             -var="adzuna_app_id=${{ secrets.ADZUNA_APP_ID }}" \
             -var="adzuna_app_key=${{ secrets.ADZUNA_APP_KEY }}" \
             -var="ses_sender=${{ secrets.SES_SENDER }}" \
@@ -108,7 +108,7 @@ jobs:
         run: |
           terraform apply -auto-approve -input=false \
             -var="image_tag=${{ steps.meta.outputs.image_tag }}" \
-            -var="gemini_api_key=${{ secrets.GEMINI_API_KEY }}" \
+            -var="groq_api_key=${{ secrets.GROQ_API_KEY }}" \
             -var="adzuna_app_id=${{ secrets.ADZUNA_APP_ID }}" \
             -var="adzuna_app_key=${{ secrets.ADZUNA_APP_KEY }}" \
             -var="ses_sender=${{ secrets.SES_SENDER }}" \

@@ -16,8 +16,8 @@ variable "image_tag" {
   default     = "latest"
 }
 
-variable "gemini_api_key" {
-  description = "Google AI Studio Gemini API key"
+variable "groq_api_key" {
+  description = "Groq API key"
   type        = string
   sensitive   = true
 }

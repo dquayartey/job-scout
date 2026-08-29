@@ -4,15 +4,19 @@ import time
 import logging
 import boto3
 import requests
-from google import genai
-from google.genai import types
-from google.genai.errors import ServerError, ClientError
+from groq import Groq
+from groq import (
+    RateLimitError,
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # ---- Config from environment (set by SAM template) ----
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 ADZUNA_APP_ID = os.environ["ADZUNA_APP_ID"]
 ADZUNA_APP_KEY = os.environ["ADZUNA_APP_KEY"]
 DDB_TABLE = os.environ["DDB_TABLE"]
@@ -24,21 +28,17 @@ JOB_COUNTRY = os.environ.get("JOB_COUNTRY", "gb")  # Adzuna country code
 MATCH_THRESHOLD = int(os.environ.get("MATCH_THRESHOLD", "7"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "20"))
 SEEN_TTL_DAYS = int(os.environ.get("SEEN_TTL_DAYS", "30"))
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# Retries for transient Gemini 503s, on top of the SDK's own internal retry
-GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "2"))
-GEMINI_RETRY_BACKOFF_S = int(os.environ.get("GEMINI_RETRY_BACKOFF_S", "5"))
+# Retries for transient errors (rate limit / connection / timeout),
+# on top of whatever the SDK does internally
+GROQ_MAX_ATTEMPTS = int(os.environ.get("GROQ_MAX_ATTEMPTS", "3"))
+GROQ_RETRY_BACKOFF_S = int(os.environ.get("GROQ_RETRY_BACKOFF_S", "5"))
 
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb").Table(DDB_TABLE)
 ses = boto3.client("ses")
-gemini = genai.Client(api_key=GEMINI_API_KEY)
-
-# Disable automatic function calling — we don't pass tools, and AFC's
-# introspection just triggers an SDK warning on every generate_content call.
-GEMINI_CONFIG = types.GenerateContentConfig(
-    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 
 def fetch_jobs():
@@ -74,30 +74,36 @@ def get_master_cv():
     return obj["Body"].read().decode("utf-8")
 
 
-def _generate_with_retry(prompt):
-    """Call Gemini with a small extra retry layer for transient 503s.
+def _chat_with_retry(messages, json_mode=False):
+    """Call Groq with a small retry layer for transient errors.
 
-    The SDK already retries internally via tenacity; this adds a couple
-    more attempts with backoff so a single momentary spike in demand
-    doesn't fail the whole batch. Raises the last error if all attempts
-    are exhausted.
+    RateLimitError (429) and connection/timeout errors are retried with
+    backoff. Anything else (bad request, auth) is not — raises immediately.
     """
+    kwargs = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
     last_err = None
-    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+    for attempt in range(1, GROQ_MAX_ATTEMPTS + 1):
         try:
-            return gemini.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=prompt,
-                config=GEMINI_CONFIG,
-            )
-        except ServerError as e:
+            return groq_client.chat.completions.create(**kwargs)
+        except RateLimitError as e:
             last_err = e
-            logger.warning(f"Gemini ServerError on attempt {attempt}/{GEMINI_MAX_ATTEMPTS}: {e}")
-            if attempt < GEMINI_MAX_ATTEMPTS:
-                time.sleep(GEMINI_RETRY_BACKOFF_S * attempt)
-        except ClientError as e:
-            # Not transient (bad request, auth, quota) — no point retrying
-            logger.error(f"Gemini ClientError (not retrying): {e}")
+            logger.warning(f"Groq RateLimitError on attempt {attempt}/{GROQ_MAX_ATTEMPTS}: {e}")
+            if attempt < GROQ_MAX_ATTEMPTS:
+                time.sleep(GROQ_RETRY_BACKOFF_S * attempt)
+        except (APIConnectionError, APITimeoutError) as e:
+            last_err = e
+            logger.warning(f"Groq connection/timeout error on attempt {attempt}/{GROQ_MAX_ATTEMPTS}: {e}")
+            if attempt < GROQ_MAX_ATTEMPTS:
+                time.sleep(GROQ_RETRY_BACKOFF_S * attempt)
+        except APIStatusError as e:
+            # Bad request, auth failure, etc. — not transient, don't retry
+            logger.error(f"Groq APIStatusError (not retrying): {e}")
             raise
     raise last_err
 
@@ -113,8 +119,11 @@ Job title: {job.get('title')}
 Company: {job.get('company', {}).get('display_name', 'Unknown')}
 Description: {job.get('description', '')[:2000]}
 """
-    response = _generate_with_retry(prompt)
-    text = response.text.strip().strip("```json").strip("```").strip()
+    response = _chat_with_retry(
+        messages=[{"role": "user", "content": prompt}],
+        json_mode=True,
+    )
+    text = response.choices[0].message.content.strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -133,8 +142,11 @@ Original CV:
 Job title: {job.get('title')}
 Job description: {job.get('description', '')[:2000]}
 """
-    response = _generate_with_retry(prompt)
-    return response.text
+    response = _chat_with_retry(
+        messages=[{"role": "user", "content": prompt}],
+        json_mode=False,
+    )
+    return response.choices[0].message.content
 
 
 def store_tailored_cv(job_id, content):
@@ -159,7 +171,7 @@ def send_digest(matches, failed_count):
     if failed_count:
         body_lines.append(
             f"\nNote: {failed_count} job(s) could not be scored due to a "
-            f"temporary Gemini API issue and will be retried on the next run.\n"
+            f"temporary Groq API issue and will be retried on the next run.\n"
         )
     body = "\n".join(body_lines)
     ses.send_email(
@@ -185,7 +197,7 @@ def handler(event, context):
 
         try:
             result = score_job(master_cv, job)
-        except (ServerError, ClientError) as e:
+        except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
             # Don't mark_seen — leave it unscored so it's retried next run
             logger.error(f"Skipping job {job_id} after scoring failure: {e}")
             failed_count += 1
@@ -205,7 +217,7 @@ def handler(event, context):
                     "url": job.get("redirect_url", ""),
                     "cv_key": cv_key,
                 })
-            except (ServerError, ClientError) as e:
+            except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
                 # Job was already scored and marked seen — a tailoring
                 # failure just means no tailored CV/digest entry this run
                 logger.error(f"CV tailoring failed for job {job_id}: {e}")
