@@ -1,0 +1,42 @@
+name: Force Unlock Terraform State (run only if stuck)
+
+# Manual trigger only. Use this if a run fails with "Error acquiring the
+# state lock" — copy the Lock ID from that error message and paste it in
+# when triggering this workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      lock_id:
+        description: "Lock ID from the 'Error acquiring the state lock' message"
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  unlock:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Force unlock
+        run: terraform force-unlock -force "${{ inputs.lock_id }}"
