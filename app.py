@@ -27,6 +27,11 @@ MAX_SCORE_ATTEMPTS = int(os.environ.get("MAX_SCORE_ATTEMPTS", "3"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 CV_LINK_EXPIRY_S = int(os.environ.get("CV_LINK_EXPIRY_S", str(7 * 24 * 3600)))  # 7 days
 
+# Candidate's actual location, used by score_job() to judge whether a
+# job's listed location/region restriction plausibly covers them, for
+# jobs tagged "remote_location_uncertain" (see match_tier()).
+CANDIDATE_LOCATION = os.environ.get("CANDIDATE_LOCATION", "Ghana")
+
 # Job search config
 JOB_QUERIES = [q.strip() for q in os.environ.get("JOB_QUERIES", "cloud engineer,devops engineer").split(",") if q.strip()]
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "100"))  # Remotive per-query limit
@@ -55,6 +60,7 @@ JUNIOR_TITLE_MARKERS = ("junior", "jr.", "jr ", "entry", "entry-level", "graduat
 
 TIER_LABELS = {
     "no_auth_required": "Remote — worldwide, no work permit needed",
+    "remote_location_uncertain": "Remote — location eligibility judged by model",
     "in_person_visa_sponsorship": "In-person — visa sponsorship available",
 }
 
@@ -154,6 +160,11 @@ def _get_remotive_jobs():
 
 
 def _get_remoteok_jobs():
+    # RemoteOK's public /api endpoint does not support server-side keyword
+    # filtering — a ?tags= param was tested empirically and made no
+    # difference to the response, despite third-party scrapers implying
+    # otherwise. This just pulls the latest ~100 jobs across every industry
+    # and re-filters locally; low yield is expected and not a bug.
     resp = requests.get("https://remoteok.com/api", headers=USER_AGENT, timeout=20)
     resp.raise_for_status()
     raw = resp.json()
@@ -190,15 +201,29 @@ def _get_arbeitnow_jobs():
 def _get_jobicy_jobs():
     # Jobicy's public API caps "count" (no documented page/offset param),
     # so 50 is close to the practical ceiling for a single call.
-    resp = requests.get(
-        "https://jobicy.com/api/v2/remote-jobs",
-        params={"count": 50},
-        headers=USER_AGENT,
-        timeout=20,
-    )
-    resp.raise_for_status()
-    raw = resp.json().get("jobs", [])
-    return [j for j in raw if _keyword_match(j.get("jobTitle"), j.get("jobExcerpt"))]
+    # tag= is a real, documented server-side filter (confirmed against
+    # Jobicy's official OpenAPI spec at github.com/Jobicy/remote-jobs-api,
+    # and verified live: appliedFilters echoed back tag=devops and returned
+    # genuinely devops-relevant titles). Query it once per JOB_QUERIES term,
+    # like the other multi-query sources, deduping by id.
+    seen_ids = set()
+    all_jobs = []
+    for query in JOB_QUERIES:
+        resp = requests.get(
+            "https://jobicy.com/api/v2/remote-jobs",
+            params={"count": 50, "tag": query},
+            headers=USER_AGENT,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        for job in resp.json().get("jobs", []):
+            job_id = job.get("id")
+            if job_id and job_id not in seen_ids:
+                seen_ids.add(job_id)
+                all_jobs.append(job)
+    # tag= is a real server-side filter, but still re-check locally in case
+    # its matching is loose, same caveat as Remotive/Himalayas server-side search.
+    return [j for j in all_jobs if _keyword_match(j.get("jobTitle"), j.get("jobExcerpt"))]
 
 
 def _get_himalayas_jobs():
@@ -324,9 +349,23 @@ def normalize_himalayas(job):
 # Seniority is NOT filtered here — it's tagged and passed through so the LLM
 # scoring step can weigh it against the candidate's actual CV, rather than a
 # title-text guess silently dropping real listings.
+#
+# Location eligibility works the same way as of this change: open_worldwide
+# is only a confident "yes" when the location text uses an explicit
+# worldwide/anywhere/global marker (or is empty). A real region list (e.g.
+# "USA", "Bulgaria", "LATAM, Argentina, Brazil, Mexico") is genuinely
+# ambiguous from keyword matching alone — it might quietly exclude the
+# candidate, or the "remote" tag might just mean payroll/timezone alignment
+# rather than a hard nationality/residency restriction. Rather than silently
+# drop those jobs, any remote job now passes through with its location
+# tagged as match_tier "remote_location_uncertain", so Groq can judge
+# eligibility explicitly against the candidate's actual location in
+# score_job() below — treating a real, listed restriction that doesn't
+# plausibly cover the candidate as a disqualifier, not just a skill-fit
+# minus (unlike the softer seniority judgment).
 
 def passes_filters(job):
-    if job["remote"] and job["open_worldwide"]:
+    if job["remote"]:
         return True
     if job["source"] == "arbeitnow" and not job["remote"] and job.get("visa_sponsorship"):
         return True
@@ -336,6 +375,8 @@ def passes_filters(job):
 def match_tier(job):
     if job["remote"] and job["open_worldwide"]:
         return "no_auth_required"
+    if job["remote"] and not job["open_worldwide"]:
+        return "remote_location_uncertain"
     if job["source"] == "arbeitnow" and not job["remote"] and job.get("visa_sponsorship"):
         return "in_person_visa_sponsorship"
     return None
@@ -441,9 +482,40 @@ def _chat_with_retry(messages, json_mode=False):
 
 
 def score_job(master_cv, job):
-    """Score a job against the CV. Seniority is given as context, not a hard
-    filter — the model decides whether a 'senior'-labeled posting is still
-    worth pursuing given the candidate's actual experience."""
+    """Score a job against the CV.
+
+    Seniority is given as context, not a hard filter — the model decides
+    whether a 'senior'-labeled posting is still worth pursuing given the
+    candidate's actual experience. A weak seniority fit should lower the
+    score, not zero it out.
+
+    Location is different. For jobs tagged "remote_location_uncertain" (a
+    real, listed region/country restriction rather than an explicit
+    worldwide/anywhere/global marker), the model must judge whether that
+    restriction plausibly covers the candidate's actual location. Unlike
+    seniority, a restriction that clearly excludes the candidate is a hard
+    disqualifier — the role may still be the right skill level, but the
+    candidate would not be eligible to work it, so it must not score above
+    threshold on skill fit alone.
+    """
+    location_instructions = ""
+    if job["match_tier"] == "remote_location_uncertain":
+        location_instructions = f"""
+This job's listed location/region eligibility is: {job['location_raw']!r}.
+The candidate is based in {CANDIDATE_LOCATION}. Judge whether this listed
+restriction plausibly covers the candidate — for example, a restriction to
+a specific country, named region, or set of countries that does not
+include {CANDIDATE_LOCATION} or a broader region containing it (e.g.
+worldwide, global, Africa) means the candidate is NOT eligible. Unlike the
+seniority judgment above, a real location/eligibility restriction that
+excludes the candidate is a HARD DISQUALIFIER: cap match_score at 2 or
+below regardless of skill fit, and say so plainly in the reasoning. Only
+score normally on skill fit if the listed location is genuinely ambiguous
+about whether it includes the candidate (e.g. it's unclear if "remote" here
+means payroll-region only vs. a hard residency requirement) — in that case,
+note the ambiguity in the reasoning rather than assuming disqualification.
+"""
+
     prompt = f"""You are screening a job posting against a candidate's CV.
 
 The job's stated seniority level is: {job['seniority']}. Titles like "Senior"
@@ -451,7 +523,7 @@ are used loosely across companies and don't always require senior-level
 experience — judge actual fit from the description and required skills, not
 just the title label. If the role clearly requires far more experience than
 the CV shows, reflect that with a lower score rather than rejecting it outright.
-
+{location_instructions}
 Return ONLY valid JSON: {{"match_score": <1-10 integer>, "reasoning": "<one sentence>"}}
 
 CV:
