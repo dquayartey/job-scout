@@ -1,9 +1,12 @@
 import os
 import json
+import re
 import time
 import logging
 import boto3
 import requests
+from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
 from groq import Groq
 from groq import (
     RateLimitError,
@@ -27,7 +30,7 @@ MAX_SCORE_ATTEMPTS = int(os.environ.get("MAX_SCORE_ATTEMPTS", "3"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 CV_LINK_EXPIRY_S = int(os.environ.get("CV_LINK_EXPIRY_S", str(7 * 24 * 3600)))  # 7 days
 
-# Candidate's actual location, used by score_job() to judge whether a
+# Candidate's actual location, used by score_jobs_batch() to judge whether a
 # job's listed location/region restriction plausibly covers them, for
 # jobs tagged "remote_location_uncertain" (see match_tier()).
 CANDIDATE_LOCATION = os.environ.get("CANDIDATE_LOCATION", "Ghana")
@@ -51,6 +54,24 @@ DESCRIPTION_CHAR_LIMIT = int(os.environ.get("DESCRIPTION_CHAR_LIMIT", "4500"))
 GROQ_MAX_ATTEMPTS = int(os.environ.get("GROQ_MAX_ATTEMPTS", "3"))
 GROQ_RETRY_BACKOFF_S = int(os.environ.get("GROQ_RETRY_BACKOFF_S", "5"))
 
+# How many jobs to score per Groq call. The CV is the single biggest
+# recurring cost in a scoring prompt (it's resent in full every call) — 
+# batching means it's sent once per SCORE_BATCH_SIZE jobs instead of once
+# per job, which is the main lever for staying inside Groq's daily token
+# budget. Keep this small enough that one batch's prompt (CV + N job
+# descriptions) still fits comfortably under the account's per-minute
+# token limit; tune down if a single batch call starts getting 429s on
+# tokens-per-minute rather than tokens-per-day.
+SCORE_BATCH_SIZE = int(os.environ.get("SCORE_BATCH_SIZE", "4"))
+
+# Same batching principle applied to CV tailoring: the master CV is the
+# shared input across every matched job in a run, so it's sent once per
+# TAILOR_BATCH_SIZE matches instead of once per match. Output doesn't
+# shrink this way (each match still needs its own full tailored CV), so
+# the savings are smaller than on the scoring side, but still worth it
+# whenever a run produces more than one match.
+TAILOR_BATCH_SIZE = int(os.environ.get("TAILOR_BATCH_SIZE", "3"))
+
 USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; JobScoutBot/1.0)"}
 REMOTE_LOCATION_MARKERS = ("worldwide", "anywhere", "global")
 
@@ -64,10 +85,38 @@ TIER_LABELS = {
     "in_person_visa_sponsorship": "In-person — visa sponsorship available",
 }
 
+# ---- concurrency lock ----
+# Multiple overlapping invocations (overlapping schedule ticks, Lambda's
+# automatic async retry, a stray manual invoke) previously ran in parallel
+# and each burned through the shared Groq daily token quota independently,
+# which is what actually exhausted the account, not any one run alone.
+# This is a hard guarantee at the code level regardless of what triggers
+# the extra invocation.
+LOCK_JOB_ID = "__run_lock__"
+LOCK_DURATION_S = 600  # generous vs. observed ~2-5 min run time; lets a crashed run self-heal instead of deadlocking forever
+
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb").Table(DDB_TABLE)
 ses = boto3.client("ses")
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+
+def acquire_lock():
+    now = int(time.time())
+    try:
+        ddb.put_item(
+            Item={"job_id": LOCK_JOB_ID, "locked_until": now + LOCK_DURATION_S, "ttl": now + LOCK_DURATION_S},
+            ConditionExpression=Attr("job_id").not_exists() | Attr("locked_until").lt(now),
+        )
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def release_lock():
+    ddb.delete_item(Key={"job_id": LOCK_JOB_ID})
 
 
 # ---- job source helpers ----
@@ -360,9 +409,9 @@ def normalize_himalayas(job):
 # drop those jobs, any remote job now passes through with its location
 # tagged as match_tier "remote_location_uncertain", so Groq can judge
 # eligibility explicitly against the candidate's actual location in
-# score_job() below — treating a real, listed restriction that doesn't
-# plausibly cover the candidate as a disqualifier, not just a skill-fit
-# minus (unlike the softer seniority judgment).
+# score_jobs_batch() below — treating a real, listed restriction that
+# doesn't plausibly cover the candidate as a disqualifier, not just a
+# skill-fit minus (unlike the softer seniority judgment).
 
 def passes_filters(job):
     if job["remote"]:
@@ -481,58 +530,72 @@ def _chat_with_retry(messages, json_mode=False):
     raise last_err
 
 
-def score_job(master_cv, job):
-    """Score a job against the CV.
-
-    Seniority is given as context, not a hard filter — the model decides
-    whether a 'senior'-labeled posting is still worth pursuing given the
-    candidate's actual experience. A weak seniority fit should lower the
-    score, not zero it out.
-
-    Location is different. For jobs tagged "remote_location_uncertain" (a
-    real, listed region/country restriction rather than an explicit
-    worldwide/anywhere/global marker), the model must judge whether that
-    restriction plausibly covers the candidate's actual location. Unlike
-    seniority, a restriction that clearly excludes the candidate is a hard
-    disqualifier — the role may still be the right skill level, but the
-    candidate would not be eligible to work it, so it must not score above
-    threshold on skill fit alone.
-    """
-    location_instructions = ""
-    if job["match_tier"] == "remote_location_uncertain":
-        location_instructions = f"""
+def _location_instructions(job):
+    if job["match_tier"] != "remote_location_uncertain":
+        return ""
+    return f"""
 This job's listed location/region eligibility is: {job['location_raw']!r}.
 The candidate is based in {CANDIDATE_LOCATION}. Judge whether this listed
 restriction plausibly covers the candidate — for example, a restriction to
 a specific country, named region, or set of countries that does not
 include {CANDIDATE_LOCATION} or a broader region containing it (e.g.
-worldwide, global, Africa) means the candidate is NOT eligible. Unlike the
-seniority judgment above, a real location/eligibility restriction that
-excludes the candidate is a HARD DISQUALIFIER: cap match_score at 2 or
-below regardless of skill fit, and say so plainly in the reasoning. Only
-score normally on skill fit if the listed location is genuinely ambiguous
-about whether it includes the candidate (e.g. it's unclear if "remote" here
-means payroll-region only vs. a hard residency requirement) — in that case,
-note the ambiguity in the reasoning rather than assuming disqualification.
+worldwide, global, Africa) means the candidate is NOT eligible. A real
+location/eligibility restriction that excludes the candidate is a HARD
+DISQUALIFIER: cap match_score at 2 or below regardless of skill fit, and
+say so plainly in the reasoning. Only score normally on skill fit if the
+listed location is genuinely ambiguous about whether it includes the
+candidate (e.g. it's unclear if "remote" here means payroll-region only
+vs. a hard residency requirement) — in that case, note the ambiguity in
+the reasoning rather than assuming disqualification.
 """
 
-    prompt = f"""You are screening a job posting against a candidate's CV.
 
-The job's stated seniority level is: {job['seniority']}. Titles like "Senior"
-are used loosely across companies and don't always require senior-level
-experience — judge actual fit from the description and required skills, not
-just the title label. If the role clearly requires far more experience than
-the CV shows, reflect that with a lower score rather than rejecting it outright.
-{location_instructions}
-Return ONLY valid JSON: {{"match_score": <1-10 integer>, "reasoning": "<one sentence>"}}
+def _job_block(job, index):
+    return f"""
+--- Job {index} (id: {job['id']}) ---
+Title: {job['title']}
+Company: {job['company']}
+Stated seniority: {job['seniority']} (titles like "Senior" are used loosely across companies and don't
+always require senior-level experience — judge actual fit from the description and required skills,
+not just the title label. If the role clearly requires far more experience than the CV shows, reflect
+that with a lower score rather than rejecting it outright.)
+Work arrangement: {job['match_tier']}
+{_location_instructions(job)}
+Description: {(job.get('description') or '')[:DESCRIPTION_CHAR_LIMIT]}
+"""
+
+
+def score_jobs_batch(master_cv, jobs_batch):
+    """Score several jobs against the CV in a single Groq call.
+
+    The CV is the single biggest recurring cost in every scoring request —
+    batching means it's only sent once per SCORE_BATCH_SIZE jobs instead of
+    once per job, which is the main lever for staying inside Groq's daily
+    token budget.
+
+    Seniority is given as context, not a hard filter. Location is
+    different: for jobs tagged "remote_location_uncertain", a restriction
+    that clearly excludes the candidate is a hard disqualifier (must not
+    score above threshold on skill fit alone) — see _location_instructions.
+
+    Returns a dict of job_id -> {"match_score": int, "reasoning": str}. A
+    job missing from the model's response (bad JSON, model dropped an
+    entry, etc.) falls back to a 0 score rather than silently vanishing —
+    same as the previous per-job parse-failure fallback.
+    """
+    jobs_text = "\n".join(_job_block(job, i) for i, job in enumerate(jobs_batch))
+    prompt = f"""You are screening job postings against a candidate's CV.
+For EACH job below, return a match_score (1-10) and a one-sentence reasoning,
+following the seniority and location instructions given per job.
 
 CV:
 {master_cv}
 
-Job title: {job['title']}
-Company: {job['company']}
-Work arrangement: {job['match_tier']}
-Description: {(job.get('description') or '')[:DESCRIPTION_CHAR_LIMIT]}
+Jobs:
+{jobs_text}
+
+Return ONLY valid JSON: {{"results": [{{"id": "<job id exactly as given>", "match_score": <1-10 integer>, "reasoning": "<one sentence>"}}, ...]}}
+Include exactly one entry per job listed above, in any order.
 """
     response = _chat_with_retry(
         messages=[{"role": "user", "content": prompt}],
@@ -540,36 +603,84 @@ Description: {(job.get('description') or '')[:DESCRIPTION_CHAR_LIMIT]}
     )
     text = response.choices[0].message.content.strip()
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"match_score": 0, "reasoning": "Could not parse model output"}
+        parsed = json.loads(text)
+        results = {r["id"]: r for r in parsed.get("results", [])}
+    except (json.JSONDecodeError, KeyError, TypeError):
+        results = {}
+    return {
+        job["id"]: results.get(job["id"], {"match_score": 0, "reasoning": "Could not parse model output"})
+        for job in jobs_batch
+    }
 
 
-def tailor_cv(master_cv, job):
+def _tailor_job_block(job, index):
     sponsorship_note = ""
     if job["match_tier"] == "in_person_visa_sponsorship":
         sponsorship_note = (
-            "\nThis is an in-person role where the employer offers visa sponsorship. "
+            "This is an in-person role where the employer offers visa sponsorship. "
             "Where natural, the CV may reflect openness to relocation, but do not "
-            "invent statements about visa status or authorization."
+            "invent statements about visa status or authorization.\n"
         )
+    return f"""
+--- Application {index} (id: {job['id']}) ---
+Job title: {job['title']}
+Company: {job['company']}
+{sponsorship_note}Job description: {(job.get('description') or '')[:DESCRIPTION_CHAR_LIMIT]}
+"""
 
-    prompt = f"""Rewrite the CV below to better match this specific job posting.
-Keep it truthful — only reorder, re-emphasize, and reword existing experience.
+
+def tailor_cvs_batch(master_cv, jobs_batch):
+    """Tailor the CV for several matched jobs in a single Groq call.
+
+    The master CV is sent once for the whole batch rather than once per
+    job — same reasoning as score_jobs_batch. Each application still gets
+    back its own full, separately-tailored CV; only the input side (the
+    shared CV) is deduplicated, not the output.
+
+    Uses a plain-text delimiter format rather than JSON mode: a tailored
+    CV is long free-form text that can contain quotes and newlines the
+    model may not escape reliably inside a JSON string, so a delimiter the
+    model just has to reproduce verbatim is more robust here than nested
+    JSON would be.
+
+    Returns a dict of job_id -> tailored CV text. A job missing from the
+    parsed output (delimiter mismatch, model dropped an entry) is simply
+    absent from the returned dict — callers should treat that as a
+    per-job tailoring failure, not raise for the whole batch.
+    """
+    jobs_text = "\n".join(_tailor_job_block(job, i) for i, job in enumerate(jobs_batch))
+    prompt = f"""Rewrite the CV below into a separate, tailored version for EACH job application listed below.
+Keep every version truthful — only reorder, re-emphasize, and reword existing experience.
 Do not invent skills or experience that aren't in the original CV.
-Return plain text only, no commentary.
-{sponsorship_note}
+
 Original CV:
 {master_cv}
 
-Job title: {job['title']}
-Job description: {(job.get('description') or '')[:DESCRIPTION_CHAR_LIMIT]}
+Applications:
+{jobs_text}
+
+For EACH application above, output its tailored CV wrapped EXACTLY like this, with no other commentary
+before, between, or after the blocks:
+===APPLICATION id=<id exactly as given above>===
+<the full tailored CV as plain text>
+===END===
+
+Output one such block per application listed above, nothing else.
 """
     response = _chat_with_retry(
         messages=[{"role": "user", "content": prompt}],
         json_mode=False,
     )
-    return response.choices[0].message.content
+    text = response.choices[0].message.content
+
+    results = {}
+    for m in re.finditer(
+        r"===APPLICATION id=(?P<id>.*?)===\s*(?P<cv>.*?)\s*===END===",
+        text,
+        re.DOTALL,
+    ):
+        results[m.group("id").strip()] = m.group("cv").strip()
+    return results
 
 
 def store_tailored_cv(job_id, content):
@@ -616,77 +727,108 @@ def send_digest(matches, failed_count):
 
 
 def handler(event, context):
-    master_cv = get_master_cv()
-    jobs = fetch_jobs()
-    matches = []
-    failed_count = 0
-    no_match_count = 0
-    skipped_max_attempts = 0
+    if not acquire_lock():
+        logger.warning("Another invocation is already running — skipping this one.")
+        return {"statusCode": 200, "body": json.dumps({"skipped": "lock_held"})}
 
-    for job in jobs:
-        job_id = job["id"]
-        if should_skip(job_id):
-            item = _get_seen_item(job_id)
+    try:
+        master_cv = get_master_cv()
+        jobs = fetch_jobs()
+
+        to_score = [j for j in jobs if not should_skip(j["id"])]
+        skipped_max_attempts = 0
+        for j in jobs:
+            if j["id"] in {t["id"] for t in to_score}:
+                continue
+            item = _get_seen_item(j["id"])
             if item and not item.get("matched") and item.get("attempts", 0) >= MAX_SCORE_ATTEMPTS:
                 skipped_max_attempts += 1
-            continue
 
-        try:
-            result = score_job(master_cv, job)
-        except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
-            # Don't record_attempt — leave it unscored so it's retried next run.
-            # Transient failures shouldn't burn one of the job's limited attempts.
-            logger.error(f"Skipping job {job_id} after scoring failure: {e}")
-            failed_count += 1
-            continue
+        matches = []
+        matched_jobs = []  # [(job, score, reasoning), ...] — tailored in a separate pass below
+        failed_count = 0
+        no_match_count = 0
 
-        score = result.get("match_score", 0)
-        reasoning = result.get("reasoning", "")
-        matched = score >= MATCH_THRESHOLD
-        attempts = record_attempt(job_id, matched)
-
-        if matched:
-            logger.info(
-                f"MATCH job_id={job_id} title={job['title']!r} "
-                f"company={job['company']!r} score={score} attempt={attempts} "
-                f"reasoning={reasoning!r}"
-            )
+        for i in range(0, len(to_score), SCORE_BATCH_SIZE):
+            batch = to_score[i:i + SCORE_BATCH_SIZE]
             try:
-                tailored = tailor_cv(master_cv, job)
-                cv_key = store_tailored_cv(job_id, tailored)
+                results = score_jobs_batch(master_cv, batch)
+            except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
+                # Don't record_attempt — leave these unscored so they're retried
+                # next run. Transient failures shouldn't burn a job's limited attempts.
+                logger.error(f"Skipping batch of {len(batch)} jobs after scoring failure: {e}")
+                failed_count += len(batch)
+                continue
+
+            for job in batch:
+                job_id = job["id"]
+                result = results[job_id]
+                score = result.get("match_score", 0)
+                reasoning = result.get("reasoning", "")
+                matched = score >= MATCH_THRESHOLD
+                attempts = record_attempt(job_id, matched)
+
+                if matched:
+                    logger.info(
+                        f"MATCH job_id={job_id} title={job['title']!r} "
+                        f"company={job['company']!r} score={score} attempt={attempts} "
+                        f"reasoning={reasoning!r}"
+                    )
+                    matched_jobs.append((job, score, reasoning))
+                else:
+                    no_match_count += 1
+                    logger.info(
+                        f"NO MATCH job_id={job_id} title={job['title']!r} "
+                        f"company={job['company']!r} source={job['source']} "
+                        f"seniority={job['seniority']} match_tier={job['match_tier']} "
+                        f"score={score} threshold={MATCH_THRESHOLD} "
+                        f"attempt={attempts}/{MAX_SCORE_ATTEMPTS} reasoning={reasoning!r}"
+                    )
+
+        # Tailor matched jobs' CVs in their own batches (separate from scoring
+        # batches — most runs will have far fewer matches than jobs scored).
+        # Note: matched jobs are already recorded via record_attempt() above,
+        # so a tailoring failure here means no digest entry for that job this
+        # run, and it won't be retried later since it's already marked matched
+        # — same trade-off as before batching, just now at batch granularity.
+        for i in range(0, len(matched_jobs), TAILOR_BATCH_SIZE):
+            batch = matched_jobs[i:i + TAILOR_BATCH_SIZE]
+            jobs_only = [item[0] for item in batch]
+            try:
+                tailored_map = tailor_cvs_batch(master_cv, jobs_only)
+            except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
+                logger.error(f"CV tailoring failed for batch of {len(batch)} jobs: {e}")
+                failed_count += len(batch)
+                continue
+
+            for job, score, reasoning in batch:
+                tailored_text = tailored_map.get(job["id"])
+                if not tailored_text:
+                    logger.error(f"CV tailoring produced no output for job {job['id']}")
+                    failed_count += 1
+                    continue
+                cv_key = store_tailored_cv(job["id"], tailored_text)
                 matches.append({
                     "title": job["title"],
                     "company": job["company"],
-                    "score": result["match_score"],
+                    "score": score,
                     "reasoning": reasoning,
                     "url": job["url"],
                     "cv_key": cv_key,
                     "match_tier": job["match_tier"],
                 })
-            except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
-                # Job was already scored and recorded as matched — a tailoring
-                # failure just means no tailored CV/digest entry this run
-                logger.error(f"CV tailoring failed for job {job_id}: {e}")
-                failed_count += 1
-        else:
-            no_match_count += 1
-            logger.info(
-                f"NO MATCH job_id={job_id} title={job['title']!r} "
-                f"company={job['company']!r} source={job['source']} "
-                f"seniority={job['seniority']} match_tier={job['match_tier']} "
-                f"score={score} threshold={MATCH_THRESHOLD} "
-                f"attempt={attempts}/{MAX_SCORE_ATTEMPTS} reasoning={reasoning!r}"
-            )
 
-    send_digest(matches, failed_count)
+        send_digest(matches, failed_count)
 
-    return {
-        "statusCode": 200,
-        "body": json.dumps({
-            "jobs_checked": len(jobs),
-            "new_matches": len(matches),
-            "no_match": no_match_count,
-            "skipped_max_attempts": skipped_max_attempts,
-            "failed": failed_count,
-        }),
-    }
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "jobs_checked": len(jobs),
+                "new_matches": len(matches),
+                "no_match": no_match_count,
+                "skipped_max_attempts": skipped_max_attempts,
+                "failed": failed_count,
+            }),
+        }
+    finally:
+        release_lock()
