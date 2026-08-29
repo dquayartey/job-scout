@@ -30,6 +30,15 @@ CV_LINK_EXPIRY_S = int(os.environ.get("CV_LINK_EXPIRY_S", str(7 * 24 * 3600)))  
 JOB_QUERIES = [q.strip() for q in os.environ.get("JOB_QUERIES", "cloud engineer,devops engineer").split(",") if q.strip()]
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "100"))  # Remotive per-query limit
 ARBEITNOW_MAX_PAGES = int(os.environ.get("ARBEITNOW_MAX_PAGES", "3"))
+HIMALAYAS_MAX_PAGES = int(os.environ.get("HIMALAYAS_MAX_PAGES", "3"))
+
+# Max chars of a job description sent to Groq for scoring/tailoring.
+# Was 2000; raised to 4500 after test_sources.py's truncation diagnostic
+# showed requirement/qualification content getting cut off for ~14% of a
+# sample of Himalayas listings, with the worst case needing 4199 chars.
+# Not a hard guarantee for all future postings — rerun the diagnostic
+# periodically as real traffic comes in.
+DESCRIPTION_CHAR_LIMIT = int(os.environ.get("DESCRIPTION_CHAR_LIMIT", "4500"))
 
 # Retries for transient Groq errors (rate limit / connection / timeout),
 # on top of whatever the SDK does internally
@@ -96,9 +105,34 @@ def _seniority_from_jobicy(job_level, title):
     return _seniority_from_title(title)
 
 
+def _seniority_from_himalayas(seniority_list, title):
+    """Himalayas provides a real structured `seniority` enum array
+    (e.g. ['Senior'], ['Entry-level']) — prefer it, fall back to title guess if empty.
+    Verified against himalayas.app/docs/data-dictionary: values are
+    Entry-level, Mid-level, Senior, Manager, Director, Executive (no
+    'Junior' value exists in their enum, unlike our internal taxonomy)."""
+    mapping = {
+        "entry-level": "junior",
+        "mid-level": "mid",
+        "senior": "senior",
+        "manager": "senior",
+        "director": "senior",
+        "executive": "senior",
+    }
+    for level in (seniority_list or []):
+        key = (level or "").strip().lower()
+        if key in mapping:
+            return mapping[key]
+    return _seniority_from_title(title)
+
+
 # ---- raw fetchers ----
 
 def _get_remotive_jobs():
+    # Queries overlap (e.g. a job can match both "cloud engineer" and
+    # "devops engineer"), so dedup by id across queries the same way
+    # Arbeitnow/Himalayas dedup across pages.
+    seen_ids = set()
     all_jobs = []
     for query in JOB_QUERIES:
         resp = requests.get(
@@ -108,7 +142,11 @@ def _get_remotive_jobs():
             timeout=20,
         )
         resp.raise_for_status()
-        all_jobs.extend(resp.json().get("jobs", []))
+        for job in resp.json().get("jobs", []):
+            job_id = job.get("id")
+            if job_id and job_id not in seen_ids:
+                seen_ids.add(job_id)
+                all_jobs.append(job)
     # Remotive's server-side "search" is loose (matches tags/category too),
     # so re-filter locally on title/description like the other sources.
     return [j for j in all_jobs if _keyword_match(j.get("title"), j.get("description"))]
@@ -160,6 +198,40 @@ def _get_jobicy_jobs():
     resp.raise_for_status()
     raw = resp.json().get("jobs", [])
     return [j for j in raw if _keyword_match(j.get("jobTitle"), j.get("jobExcerpt"))]
+
+
+def _get_himalayas_jobs():
+    """Uses the real search endpoint (himalayas.app/jobs/api/search), which
+    is page-based. Paginated across HIMALAYAS_MAX_PAGES per query — the
+    search endpoint's per-page size isn't documented, so we can't assume one
+    page covers everything (mirrors Arbeitnow's break-on-empty pattern).
+    Re-applies local keyword matching same as the other sources, since q= is
+    a free-text query and may match tags/categories loosely, same caveat as
+    Remotive's server-side search."""
+    seen_guids = set()
+    all_jobs = []
+    for query in JOB_QUERIES:
+        for page in range(1, HIMALAYAS_MAX_PAGES + 1):
+            resp = requests.get(
+                "https://himalayas.app/jobs/api/search",
+                params={"q": query, "worldwide": "true", "page": page},
+                headers=USER_AGENT,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            page_jobs = resp.json().get("jobs", [])
+            if not page_jobs:
+                break  # no more pages
+            new_on_this_page = 0
+            for job in page_jobs:
+                guid = job.get("guid")
+                if guid and guid not in seen_guids:
+                    seen_guids.add(guid)
+                    all_jobs.append(job)
+                    new_on_this_page += 1
+            if new_on_this_page == 0:
+                break  # page repeated the same content as before — past the real last page
+    return [j for j in all_jobs if _keyword_match(j.get("title"), j.get("excerpt"))]
 
 
 # ---- normalizers: map each source into one common schema ----
@@ -228,6 +300,25 @@ def normalize_jobicy(job):
     }
 
 
+def normalize_himalayas(job):
+    location_restrictions = job.get("locationRestrictions") or []
+    return {
+        "id": f"himalayas:{job.get('guid')}",
+        "source": "himalayas",
+        "title": job.get("title"),
+        "company": job.get("companyName"),
+        "url": job.get("applicationLink"),
+        "location_raw": ", ".join(c.get("name", "") for c in location_restrictions) or "Worldwide",
+        "remote": True,  # Himalayas is a remote-only job board
+        "open_worldwide": len(location_restrictions) == 0,  # per Himalayas' documented schema
+        "visa_sponsorship": None,
+        "seniority": _seniority_from_himalayas(job.get("seniority"), job.get("title")),
+        # Full HTML description preferred over the short excerpt — the excerpt
+        # alone starves the scoring/tailoring prompts of real content.
+        "description": job.get("description") or job.get("excerpt"),
+    }
+
+
 # ---- filter + tier + dedup ----
 # Seniority is NOT filtered here — it's tagged and passed through so the LLM
 # scoring step can weigh it against the candidate's actual CV, rather than a
@@ -261,12 +352,13 @@ def dedup(jobs):
 
 
 def fetch_jobs():
-    """Pull remote/visa-eligible listings from four free job APIs, filtered and deduped."""
+    """Pull remote/visa-eligible listings from five free job APIs, filtered and deduped."""
     raw = []
     raw += [normalize_remotive(j) for j in _get_remotive_jobs()]
     raw += [normalize_remoteok(j) for j in _get_remoteok_jobs()]
     raw += [normalize_arbeitnow(j) for j in _get_arbeitnow_jobs()]
     raw += [normalize_jobicy(j) for j in _get_jobicy_jobs()]
+    raw += [normalize_himalayas(j) for j in _get_himalayas_jobs()]
 
     filtered = [j for j in raw if passes_filters(j)]
     for j in filtered:
@@ -347,7 +439,7 @@ CV:
 Job title: {job['title']}
 Company: {job['company']}
 Work arrangement: {job['match_tier']}
-Description: {(job.get('description') or '')[:2000]}
+Description: {(job.get('description') or '')[:DESCRIPTION_CHAR_LIMIT]}
 """
     response = _chat_with_retry(
         messages=[{"role": "user", "content": prompt}],
@@ -378,7 +470,7 @@ Original CV:
 {master_cv}
 
 Job title: {job['title']}
-Job description: {(job.get('description') or '')[:2000]}
+Job description: {(job.get('description') or '')[:DESCRIPTION_CHAR_LIMIT]}
 """
     response = _chat_with_retry(
         messages=[{"role": "user", "content": prompt}],
