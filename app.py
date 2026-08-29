@@ -70,7 +70,7 @@ Company: {job.get('company', {}).get('display_name', 'Unknown')}
 Description: {job.get('description', '')[:2000]}
 """
     response = gemini.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=prompt,
     )
     text = response.text.strip().strip("```json").strip("```").strip()
@@ -93,7 +93,7 @@ Job title: {job.get('title')}
 Job description: {job.get('description', '')[:2000]}
 """
     response = gemini.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=prompt,
     )
     return response.text
