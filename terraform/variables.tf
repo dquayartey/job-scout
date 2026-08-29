@@ -71,5 +71,5 @@ variable "lambda_memory_mb" {
 variable "lambda_timeout_s" {
   description = "Lambda timeout in seconds"
   type        = number
-  default     = 120
+  default     = 300
 }
