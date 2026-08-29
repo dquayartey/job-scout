@@ -8,8 +8,6 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: job-scout
-  # Guarantees Terraform never blocks on an interactive prompt in CI —
-  # any missing input becomes an immediate error instead of a silent hang.
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
 
@@ -17,10 +15,6 @@ permissions:
   id-token: write
   contents: read
 
-# Prevents two runs (e.g. two quick pushes to main) from racing against the
-# same AWS resources / local state at once. Queues the newer run instead of
-# cancelling the older one mid-apply, since killing an in-progress apply can
-# leave infrastructure half-changed.
 concurrency:
   group: terraform-deploy
   cancel-in-progress: false
@@ -45,26 +39,6 @@ jobs:
 
       - name: Terraform Init
         run: terraform init -input=false
-
-      # Each run starts with empty local state, but the ECR repo may already
-      # exist in AWS from a previous run. If so, import it into state before
-      # apply tries (and fails) to create it again.
-      - name: Import existing ECR repository into state
-        run: |
-          if aws ecr describe-repositories \
-              --repository-names "${{ env.ECR_REPOSITORY }}" \
-              --region "${{ env.AWS_REGION }}" >/dev/null 2>&1; then
-            echo "Repository exists in AWS — importing into Terraform state"
-            terraform import -input=false \
-              -var="gemini_api_key=${{ secrets.GEMINI_API_KEY }}" \
-              -var="adzuna_app_id=${{ secrets.ADZUNA_APP_ID }}" \
-              -var="adzuna_app_key=${{ secrets.ADZUNA_APP_KEY }}" \
-              -var="ses_sender=${{ secrets.SES_SENDER }}" \
-              -var="ses_recipient=${{ secrets.SES_RECIPIENT }}" \
-              aws_ecr_repository.job_scout "${{ env.ECR_REPOSITORY }}"
-          else
-            echo "Repository does not exist yet — Terraform will create it"
-          fi
 
       - name: Terraform Apply - ECR only (bootstrap)
         run: |
