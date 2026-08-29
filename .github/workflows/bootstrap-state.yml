@@ -94,6 +94,7 @@ jobs:
           import_if_needed aws_s3_bucket.job_scout job-scout-677276098035
           import_if_needed aws_iam_role.lambda_exec job-scout-lambda-exec
           import_if_needed aws_lambda_function.job_scout job-scout-auto
+          import_if_needed aws_lambda_permission.allow_eventbridge job-scout-auto/AllowEventBridgeInvoke
 
       - name: Show what's left to reconcile
         run: |
