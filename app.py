@@ -5,6 +5,7 @@ import time
 import logging
 import boto3
 import requests
+from datetime import datetime, timezone
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 from groq import Groq
@@ -27,6 +28,10 @@ SES_RECIPIENT = os.environ["SES_RECIPIENT"]
 MATCH_THRESHOLD = int(os.environ.get("MATCH_THRESHOLD", "7"))
 SEEN_TTL_DAYS = int(os.environ.get("SEEN_TTL_DAYS", "30"))
 MAX_SCORE_ATTEMPTS = int(os.environ.get("MAX_SCORE_ATTEMPTS", "3"))
+# A matched job keeps appearing in the digest — reusing its existing tailored
+# CV, no further Groq calls — until it's been included on this many distinct
+# calendar dates, at which point should_skip() retires it for good.
+NOTIFY_DAYS_REQUIRED = int(os.environ.get("NOTIFY_DAYS_REQUIRED", "3"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 CV_LINK_EXPIRY_S = int(os.environ.get("CV_LINK_EXPIRY_S", str(7 * 24 * 3600)))  # 7 days
 
@@ -116,7 +121,12 @@ def acquire_lock():
 
 
 def release_lock():
-    ddb.delete_item(Key={"job_id": LOCK_JOB_ID})
+    # Overwrite rather than delete: the Lambda's execution role only has
+    # PutItem on this table (already needed for record_attempt), not
+    # DeleteItem, and there's no reason to add a permission just for this
+    # when a put with an already-expired locked_until does the same job.
+    now = int(time.time())
+    ddb.put_item(Item={"job_id": LOCK_JOB_ID, "locked_until": now, "ttl": now + LOCK_DURATION_S})
 
 
 # ---- job source helpers ----
@@ -462,33 +472,81 @@ def _get_seen_item(job_id):
     return ddb.get_item(Key={"job_id": job_id}).get("Item")
 
 
+def _today_str():
+    # Ghana and UTC are the same offset, so this lines up with the
+    # candidate's local calendar day without any conversion.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def should_skip(job_id):
-    """A job is skipped only once it has either already matched (no reason
-    to rescore something already surfaced) or has been scored
-    MAX_SCORE_ATTEMPTS times without matching. LLM scoring has some
-    run-to-run variance, so a single unlucky score shouldn't permanently
-    bury a job that might score above threshold on a later attempt."""
+    """A job is fully "seen" and done — never scored, tailored, or emailed
+    about again — once either:
+      - it has matched and been included in the digest on
+        NOTIFY_DAYS_REQUIRED separate calendar dates, or
+      - it has been scored MAX_SCORE_ATTEMPTS times without ever matching.
+    LLM scoring has some run-to-run variance, so a single unlucky score
+    shouldn't permanently bury a job that might score above threshold on a
+    later attempt.
+
+    Note: handler() re-implements this same partitioning inline (it also
+    needs the "matched but not yet retired" case, which isn't a pure
+    skip/don't-skip decision) — kept here too since it documents the
+    retirement rule on its own and is a natural helper for anything else
+    (tests, a future admin script) that just needs a yes/no per job.
+    """
     item = _get_seen_item(job_id)
     if item is None:
         return False
     if item.get("matched"):
-        return True
+        return len(item.get("match_dates", [])) >= NOTIFY_DAYS_REQUIRED
     return item.get("attempts", 0) >= MAX_SCORE_ATTEMPTS
 
 
-def record_attempt(job_id, matched):
-    """Increment this job's attempt count and record whether it matched.
+def record_attempt(job_id, matched, score=None, reasoning=None):
+    """Increment this job's scoring-attempt count and record the outcome.
+    Preserves match_dates/cv_key from any prior record — this only tracks
+    scoring, not digest notifications (see record_notify_day for that).
     Returns the new attempt count (used for logging)."""
-    item = _get_seen_item(job_id)
-    attempts = (item.get("attempts", 0) if item else 0) + 1
+    item = _get_seen_item(job_id) or {}
+    attempts = item.get("attempts", 0) + 1
     ddb.put_item(Item={
         "job_id": job_id,
         "attempts": attempts,
-        "matched": matched,
+        "matched": matched or item.get("matched", False),
+        "last_score": score if score is not None else item.get("last_score"),
+        "last_reasoning": reasoning if reasoning is not None else item.get("last_reasoning"),
+        "match_dates": item.get("match_dates", []),
+        "cv_key": item.get("cv_key"),
         "seen_at": int(time.time()),
         "ttl": int(time.time()) + SEEN_TTL_DAYS * 86400,
     })
     return attempts
+
+
+def record_notify_day(job_id, cv_key=None):
+    """Record that this job was just included in the digest email. Adds
+    today's date to match_dates if it isn't already there (so re-running
+    the Lambda twice in one day doesn't double-count a notify day), and
+    stores cv_key the first time it's tailored so later notify days can
+    reuse the same tailored CV without calling Groq again.
+    Returns the new count of distinct notify dates (used for logging)."""
+    item = _get_seen_item(job_id) or {}
+    match_dates = list(item.get("match_dates", []))
+    today = _today_str()
+    if today not in match_dates:
+        match_dates.append(today)
+    ddb.put_item(Item={
+        "job_id": job_id,
+        "attempts": item.get("attempts", 0),
+        "matched": True,
+        "last_score": item.get("last_score"),
+        "last_reasoning": item.get("last_reasoning"),
+        "match_dates": match_dates,
+        "cv_key": cv_key if cv_key is not None else item.get("cv_key"),
+        "seen_at": int(time.time()),
+        "ttl": int(time.time()) + SEEN_TTL_DAYS * 86400,
+    })
+    return len(match_dates)
 
 
 def get_master_cv():
@@ -683,16 +741,22 @@ Output one such block per application listed above, nothing else.
     return results
 
 
-def store_tailored_cv(job_id, content):
-    # job_id contains a colon (e.g. "remotive:12345") — safe as an S3 key component
-    key = f"tailored-cvs/{job_id.replace(':', '_')}.txt"
-    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=content.encode("utf-8"))
-    url = s3.generate_presigned_url(
+def _presigned_cv_url(key):
+    return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": key},
         ExpiresIn=CV_LINK_EXPIRY_S,
     )
-    return url
+
+
+def store_tailored_cv(job_id, content):
+    # job_id contains a colon (e.g. "remotive:12345") — safe as an S3 key component
+    key = f"tailored-cvs/{job_id.replace(':', '_')}.txt"
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=content.encode("utf-8"))
+    # Returns both — callers that need to re-notify on a later day store the
+    # key (via record_notify_day) and re-derive a fresh presigned URL from
+    # it later, since ExpiresIn is shorter than a job could stay eligible for.
+    return key, _presigned_cv_url(key)
 
 
 def send_digest(matches, failed_count):
@@ -700,19 +764,23 @@ def send_digest(matches, failed_count):
         return
     body_lines = []
     if matches:
-        body_lines.append("New job matches found:\n")
+        body_lines.append(f"Job matches ({NOTIFY_DAYS_REQUIRED}-day reminder cycle):\n")
         for m in matches:
             tier_label = TIER_LABELS.get(m["match_tier"], m["match_tier"])
+            day_label = (
+                "First alert" if m["notify_day"] == 1
+                else f"Reminder {m['notify_day']}/{NOTIFY_DAYS_REQUIRED}"
+            )
             body_lines.append(
-                f"- {m['title']} @ {m['company']} (score {m['score']}/10)\n"
+                f"- {m['title']} @ {m['company']} (score {m['score']}/10) — {day_label}\n"
                 f"  {tier_label}\n"
                 f"  {m['reasoning']}\n"
                 f"  Listing: {m['url']}\n"
-                f"  Tailored CV: {m['cv_key']}\n"
+                f"  Tailored CV: {m['cv_url']}\n"
             )
     if failed_count:
         body_lines.append(
-            f"\nNote: {failed_count} job(s) could not be scored due to a "
+            f"\nNote: {failed_count} job(s) could not be scored/tailored due to a "
             f"temporary Groq API issue and will be retried on the next run.\n"
         )
     body = "\n".join(body_lines)
@@ -720,7 +788,7 @@ def send_digest(matches, failed_count):
         Source=SES_SENDER,
         Destination={"ToAddresses": [SES_RECIPIENT]},
         Message={
-            "Subject": {"Data": f"Job Scout: {len(matches)} new match(es)"},
+            "Subject": {"Data": f"Job Scout: {len(matches)} match(es) today"},
             "Body": {"Text": {"Data": body}},
         },
     )
@@ -735,17 +803,43 @@ def handler(event, context):
         master_cv = get_master_cv()
         jobs = fetch_jobs()
 
-        to_score = [j for j in jobs if not should_skip(j["id"])]
+        # Partition every job currently returned by the sources into three
+        # buckets: needs scoring (never seen, or seen but not yet matched
+        # and under MAX_SCORE_ATTEMPTS), needs a re-notify today (already
+        # matched, under NOTIFY_DAYS_REQUIRED distinct notify dates, not
+        # already notified today), or fully done (should_skip == True, or
+        # already matched *and* already notified today so there's nothing
+        # to do for it this run).
+        to_score = []
+        to_renotify = []  # [(job, item), ...] — no Groq calls needed, reuses stored cv_key
         skipped_max_attempts = 0
-        for j in jobs:
-            if j["id"] in {t["id"] for t in to_score}:
+        skipped_fully_seen = 0
+
+        for job in jobs:
+            item = _get_seen_item(job["id"])
+            if item is None:
+                to_score.append(job)
                 continue
-            item = _get_seen_item(j["id"])
-            if item and not item.get("matched") and item.get("attempts", 0) >= MAX_SCORE_ATTEMPTS:
+            if item.get("matched"):
+                if len(item.get("match_dates", [])) >= NOTIFY_DAYS_REQUIRED:
+                    skipped_fully_seen += 1
+                    continue
+                # Still within the notify window — always re-notify on
+                # invocation, even if this Lambda already ran (and emailed
+                # about this job) earlier today. record_notify_day() dedupes
+                # by calendar date, so multiple same-day invocations don't
+                # advance the retirement count faster than once per day;
+                # they just mean the candidate gets emailed more than once
+                # that day, which is fine.
+                to_renotify.append((job, item))
+                continue
+            if item.get("attempts", 0) >= MAX_SCORE_ATTEMPTS:
                 skipped_max_attempts += 1
+                continue
+            to_score.append(job)
 
         matches = []
-        matched_jobs = []  # [(job, score, reasoning), ...] — tailored in a separate pass below
+        newly_matched = []  # [(job, score, reasoning), ...] — tailored in a separate pass below
         failed_count = 0
         no_match_count = 0
 
@@ -766,7 +860,7 @@ def handler(event, context):
                 score = result.get("match_score", 0)
                 reasoning = result.get("reasoning", "")
                 matched = score >= MATCH_THRESHOLD
-                attempts = record_attempt(job_id, matched)
+                attempts = record_attempt(job_id, matched, score, reasoning)
 
                 if matched:
                     logger.info(
@@ -774,7 +868,7 @@ def handler(event, context):
                         f"company={job['company']!r} score={score} attempt={attempts} "
                         f"reasoning={reasoning!r}"
                     )
-                    matched_jobs.append((job, score, reasoning))
+                    newly_matched.append((job, score, reasoning))
                 else:
                     no_match_count += 1
                     logger.info(
@@ -785,14 +879,15 @@ def handler(event, context):
                         f"attempt={attempts}/{MAX_SCORE_ATTEMPTS} reasoning={reasoning!r}"
                     )
 
-        # Tailor matched jobs' CVs in their own batches (separate from scoring
-        # batches — most runs will have far fewer matches than jobs scored).
-        # Note: matched jobs are already recorded via record_attempt() above,
-        # so a tailoring failure here means no digest entry for that job this
-        # run, and it won't be retried later since it's already marked matched
-        # — same trade-off as before batching, just now at batch granularity.
-        for i in range(0, len(matched_jobs), TAILOR_BATCH_SIZE):
-            batch = matched_jobs[i:i + TAILOR_BATCH_SIZE]
+        # Tailor newly-matched jobs' CVs in their own batches — this only
+        # ever runs once per job, the first day it crosses MATCH_THRESHOLD.
+        # A tailoring failure here means this job doesn't get a digest entry
+        # or a recorded notify day this run; since record_attempt already
+        # marked it matched, it'll simply be retried as a to_renotify
+        # candidate next run (it has no match_dates yet, so it isn't at risk
+        # of being retired early).
+        for i in range(0, len(newly_matched), TAILOR_BATCH_SIZE):
+            batch = newly_matched[i:i + TAILOR_BATCH_SIZE]
             jobs_only = [item[0] for item in batch]
             try:
                 tailored_map = tailor_cvs_batch(master_cv, jobs_only)
@@ -807,16 +902,42 @@ def handler(event, context):
                     logger.error(f"CV tailoring produced no output for job {job['id']}")
                     failed_count += 1
                     continue
-                cv_key = store_tailored_cv(job["id"], tailored_text)
+                cv_key, cv_url = store_tailored_cv(job["id"], tailored_text)
+                notify_day = record_notify_day(job["id"], cv_key)
                 matches.append({
                     "title": job["title"],
                     "company": job["company"],
                     "score": score,
                     "reasoning": reasoning,
                     "url": job["url"],
-                    "cv_key": cv_key,
+                    "cv_url": cv_url,
                     "match_tier": job["match_tier"],
+                    "notify_day": notify_day,
                 })
+
+        # Re-notify jobs matched on an earlier run: no Groq calls at all —
+        # reuse the CV already tailored and stored the first time, just
+        # regenerate a fresh presigned URL (ExpiresIn is shorter than a job
+        # could stay eligible for) and log today as another notify date.
+        for job, item in to_renotify:
+            cv_key = item.get("cv_key")
+            if not cv_key:
+                # Shouldn't happen (a matched job always gets a cv_key on
+                # the day it's tailored), but don't crash the run over it.
+                logger.error(f"Matched job {job['id']} has no stored cv_key — skipping re-notify")
+                continue
+            cv_url = _presigned_cv_url(cv_key)
+            notify_day = record_notify_day(job["id"], cv_key)
+            matches.append({
+                "title": job["title"],
+                "company": job["company"],
+                "score": item.get("last_score"),
+                "reasoning": item.get("last_reasoning"),
+                "url": job["url"],
+                "cv_url": cv_url,
+                "match_tier": job["match_tier"],
+                "notify_day": notify_day,
+            })
 
         send_digest(matches, failed_count)
 
@@ -827,6 +948,7 @@ def handler(event, context):
                 "new_matches": len(matches),
                 "no_match": no_match_count,
                 "skipped_max_attempts": skipped_max_attempts,
+                "skipped_fully_seen": skipped_fully_seen,
                 "failed": failed_count,
             }),
         }
