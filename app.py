@@ -15,26 +15,38 @@ from groq import (
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# ---- Config from environment (set by SAM template) ----
+# ---- Config from environment (set by SAM/Terraform) ----
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-ADZUNA_APP_ID = os.environ["ADZUNA_APP_ID"]
-ADZUNA_APP_KEY = os.environ["ADZUNA_APP_KEY"]
 DDB_TABLE = os.environ["DDB_TABLE"]
 S3_BUCKET = os.environ["S3_BUCKET"]
 SES_SENDER = os.environ["SES_SENDER"]
 SES_RECIPIENT = os.environ["SES_RECIPIENT"]
-JOB_QUERY = os.environ.get("JOB_QUERY", "cloud engineer")
-JOB_COUNTRY = os.environ.get("JOB_COUNTRY", "gb")  # Adzuna country code
 MATCH_THRESHOLD = int(os.environ.get("MATCH_THRESHOLD", "7"))
-MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "20"))
 SEEN_TTL_DAYS = int(os.environ.get("SEEN_TTL_DAYS", "30"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 CV_LINK_EXPIRY_S = int(os.environ.get("CV_LINK_EXPIRY_S", str(7 * 24 * 3600)))  # 7 days
 
-# Retries for transient errors (rate limit / connection / timeout),
+# Job search config
+JOB_QUERIES = [q.strip() for q in os.environ.get("JOB_QUERIES", "cloud engineer,devops engineer").split(",") if q.strip()]
+MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "100"))  # Remotive per-query limit
+ARBEITNOW_MAX_PAGES = int(os.environ.get("ARBEITNOW_MAX_PAGES", "3"))
+
+# Retries for transient Groq errors (rate limit / connection / timeout),
 # on top of whatever the SDK does internally
 GROQ_MAX_ATTEMPTS = int(os.environ.get("GROQ_MAX_ATTEMPTS", "3"))
 GROQ_RETRY_BACKOFF_S = int(os.environ.get("GROQ_RETRY_BACKOFF_S", "5"))
+
+USER_AGENT = {"User-Agent": "Mozilla/5.0 (compatible; JobScoutBot/1.0)"}
+REMOTE_LOCATION_MARKERS = ("worldwide", "anywhere", "global")
+
+# Used only to tag seniority for the LLM's benefit — NOT to filter jobs out.
+SENIOR_TITLE_MARKERS = ("senior", "sr.", "sr ", "lead", "staff", "principal", "manager", "director", "head of")
+JUNIOR_TITLE_MARKERS = ("junior", "jr.", "jr ", "entry", "entry-level", "graduate", "associate")
+
+TIER_LABELS = {
+    "no_auth_required": "Remote — worldwide, no work permit needed",
+    "in_person_visa_sponsorship": "In-person — visa sponsorship available",
+}
 
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb").Table(DDB_TABLE)
@@ -42,19 +54,225 @@ ses = boto3.client("ses")
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 
-def fetch_jobs():
-    """Pull live listings from Adzuna's free job-search API."""
-    url = f"https://api.adzuna.com/v1/api/jobs/{JOB_COUNTRY}/search/1"
-    params = {
-        "app_id": ADZUNA_APP_ID,
-        "app_key": ADZUNA_APP_KEY,
-        "results_per_page": MAX_RESULTS,
-        "what": JOB_QUERY,
-        "content-type": "application/json",
-    }
-    resp = requests.get(url, params=params, timeout=20)
+# ---- job source helpers ----
+
+def _is_open_location(location_text):
+    """True if a remote listing's location field states worldwide eligibility, or states nothing."""
+    text = (location_text or "").strip().lower()
+    if text == "":
+        return True
+    return any(marker in text for marker in REMOTE_LOCATION_MARKERS)
+
+
+def _keyword_match(*fields):
+    haystack = " ".join(f or "" for f in fields).lower()
+    return any(query in haystack for query in JOB_QUERIES)
+
+
+def _seniority_from_title(title):
+    """Soft guess from title text — used as a fallback when a source has no real level field."""
+    text = (title or "").strip().lower()
+    if any(marker in text for marker in SENIOR_TITLE_MARKERS):
+        return "senior"
+    if any(marker in text for marker in JUNIOR_TITLE_MARKERS):
+        return "junior"
+    return "unspecified"
+
+
+def _seniority_from_jobicy(job_level, title):
+    """Jobicy provides a real jobLevel field — prefer it, fall back to title guess if missing.
+    Observed real values: 'Senior', 'Junior', 'Entry Level', 'Officer/Mid-Level', etc.
+    Matched case-insensitively/by substring since the exact vocabulary isn't officially documented.
+    """
+    text = (job_level or "").strip().lower()
+    if not text:
+        return _seniority_from_title(title)
+    if "senior" in text or "lead" in text or "staff" in text or "principal" in text:
+        return "senior"
+    if "entry" in text or "junior" in text:
+        return "junior"
+    if "mid" in text:
+        return "mid"
+    return _seniority_from_title(title)
+
+
+# ---- raw fetchers ----
+
+def _get_remotive_jobs():
+    all_jobs = []
+    for query in JOB_QUERIES:
+        resp = requests.get(
+            "https://remotive.com/api/remote-jobs",
+            params={"search": query, "limit": MAX_RESULTS},
+            headers=USER_AGENT,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        all_jobs.extend(resp.json().get("jobs", []))
+    # Remotive's server-side "search" is loose (matches tags/category too),
+    # so re-filter locally on title/description like the other sources.
+    return [j for j in all_jobs if _keyword_match(j.get("title"), j.get("description"))]
+
+
+def _get_remoteok_jobs():
+    resp = requests.get("https://remoteok.com/api", headers=USER_AGENT, timeout=20)
     resp.raise_for_status()
-    return resp.json().get("results", [])
+    raw = resp.json()
+    raw = raw[1:] if raw and "legal" in str(raw[0]).lower() else raw
+    return [j for j in raw if _keyword_match(j.get("position"), j.get("description"))]
+
+
+def _get_arbeitnow_jobs():
+    seen_slugs = set()
+    all_jobs = []
+    for page in range(1, ARBEITNOW_MAX_PAGES + 1):
+        resp = requests.get(
+            "https://arbeitnow.com/api/job-board-api",
+            params={"page": page},
+            headers=USER_AGENT,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        page_data = resp.json().get("data", [])
+        if not page_data:
+            break  # no more pages
+        new_on_this_page = 0
+        for job in page_data:
+            slug = job.get("slug")
+            if slug and slug not in seen_slugs:
+                seen_slugs.add(slug)
+                all_jobs.append(job)
+                new_on_this_page += 1
+        if new_on_this_page == 0:
+            break  # page repeated the same content as before — past the real last page
+    return [j for j in all_jobs if _keyword_match(j.get("title"), j.get("description"))]
+
+
+def _get_jobicy_jobs():
+    # Jobicy's public API caps "count" (no documented page/offset param),
+    # so 50 is close to the practical ceiling for a single call.
+    resp = requests.get(
+        "https://jobicy.com/api/v2/remote-jobs",
+        params={"count": 50},
+        headers=USER_AGENT,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    raw = resp.json().get("jobs", [])
+    return [j for j in raw if _keyword_match(j.get("jobTitle"), j.get("jobExcerpt"))]
+
+
+# ---- normalizers: map each source into one common schema ----
+
+def normalize_remotive(job):
+    return {
+        "id": f"remotive:{job.get('id')}",
+        "source": "remotive",
+        "title": job.get("title"),
+        "company": job.get("company_name"),
+        "url": job.get("url"),
+        "location_raw": job.get("candidate_required_location"),
+        "remote": True,
+        "open_worldwide": _is_open_location(job.get("candidate_required_location")),
+        "visa_sponsorship": None,
+        "seniority": _seniority_from_title(job.get("title")),
+        "description": job.get("description"),
+    }
+
+
+def normalize_remoteok(job):
+    return {
+        "id": f"remoteok:{job.get('id')}",
+        "source": "remoteok",
+        "title": job.get("position"),
+        "company": job.get("company"),
+        "url": job.get("url") or job.get("apply_url"),
+        "location_raw": job.get("location"),
+        "remote": True,
+        "open_worldwide": _is_open_location(job.get("location")),
+        "visa_sponsorship": None,
+        "seniority": _seniority_from_title(job.get("position")),
+        "description": job.get("description"),
+    }
+
+
+def normalize_arbeitnow(job):
+    return {
+        "id": f"arbeitnow:{job.get('slug')}",
+        "source": "arbeitnow",
+        "title": job.get("title"),
+        "company": job.get("company_name"),
+        "url": job.get("url"),
+        "location_raw": job.get("location"),
+        "remote": bool(job.get("remote")),
+        "open_worldwide": _is_open_location(job.get("location")),
+        "visa_sponsorship": bool(job.get("visa_sponsorship")),
+        "seniority": _seniority_from_title(job.get("title")),
+        "description": job.get("description"),
+    }
+
+
+def normalize_jobicy(job):
+    return {
+        "id": f"jobicy:{job.get('id')}",
+        "source": "jobicy",
+        "title": job.get("jobTitle"),
+        "company": job.get("companyName"),
+        "url": job.get("url"),
+        "location_raw": job.get("jobGeo"),
+        "remote": True,
+        "open_worldwide": _is_open_location(job.get("jobGeo")),
+        "visa_sponsorship": None,
+        "seniority": _seniority_from_jobicy(job.get("jobLevel"), job.get("jobTitle")),
+        "description": job.get("jobExcerpt"),
+    }
+
+
+# ---- filter + tier + dedup ----
+# Seniority is NOT filtered here — it's tagged and passed through so the LLM
+# scoring step can weigh it against the candidate's actual CV, rather than a
+# title-text guess silently dropping real listings.
+
+def passes_filters(job):
+    if job["remote"] and job["open_worldwide"]:
+        return True
+    if job["source"] == "arbeitnow" and not job["remote"] and job.get("visa_sponsorship"):
+        return True
+    return False
+
+
+def match_tier(job):
+    if job["remote"] and job["open_worldwide"]:
+        return "no_auth_required"
+    if job["source"] == "arbeitnow" and not job["remote"] and job.get("visa_sponsorship"):
+        return "in_person_visa_sponsorship"
+    return None
+
+
+def dedup(jobs):
+    seen = set()
+    unique = []
+    for job in jobs:
+        key = (job["title"] or "").strip().lower(), (job["company"] or "").strip().lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(job)
+    return unique
+
+
+def fetch_jobs():
+    """Pull remote/visa-eligible listings from four free job APIs, filtered and deduped."""
+    raw = []
+    raw += [normalize_remotive(j) for j in _get_remotive_jobs()]
+    raw += [normalize_remoteok(j) for j in _get_remoteok_jobs()]
+    raw += [normalize_arbeitnow(j) for j in _get_arbeitnow_jobs()]
+    raw += [normalize_jobicy(j) for j in _get_jobicy_jobs()]
+
+    filtered = [j for j in raw if passes_filters(j)]
+    for j in filtered:
+        j["match_tier"] = match_tier(j)
+
+    return dedup(filtered)
 
 
 def already_seen(job_id):
@@ -110,15 +328,26 @@ def _chat_with_retry(messages, json_mode=False):
 
 
 def score_job(master_cv, job):
+    """Score a job against the CV. Seniority is given as context, not a hard
+    filter — the model decides whether a 'senior'-labeled posting is still
+    worth pursuing given the candidate's actual experience."""
     prompt = f"""You are screening a job posting against a candidate's CV.
+
+The job's stated seniority level is: {job['seniority']}. Titles like "Senior"
+are used loosely across companies and don't always require senior-level
+experience — judge actual fit from the description and required skills, not
+just the title label. If the role clearly requires far more experience than
+the CV shows, reflect that with a lower score rather than rejecting it outright.
+
 Return ONLY valid JSON: {{"match_score": <1-10 integer>, "reasoning": "<one sentence>"}}
 
 CV:
 {master_cv}
 
-Job title: {job.get('title')}
-Company: {job.get('company', {}).get('display_name', 'Unknown')}
-Description: {job.get('description', '')[:2000]}
+Job title: {job['title']}
+Company: {job['company']}
+Work arrangement: {job['match_tier']}
+Description: {(job.get('description') or '')[:2000]}
 """
     response = _chat_with_retry(
         messages=[{"role": "user", "content": prompt}],
@@ -132,16 +361,24 @@ Description: {job.get('description', '')[:2000]}
 
 
 def tailor_cv(master_cv, job):
+    sponsorship_note = ""
+    if job["match_tier"] == "in_person_visa_sponsorship":
+        sponsorship_note = (
+            "\nThis is an in-person role where the employer offers visa sponsorship. "
+            "Where natural, the CV may reflect openness to relocation, but do not "
+            "invent statements about visa status or authorization."
+        )
+
     prompt = f"""Rewrite the CV below to better match this specific job posting.
 Keep it truthful — only reorder, re-emphasize, and reword existing experience.
 Do not invent skills or experience that aren't in the original CV.
 Return plain text only, no commentary.
-
+{sponsorship_note}
 Original CV:
 {master_cv}
 
-Job title: {job.get('title')}
-Job description: {job.get('description', '')[:2000]}
+Job title: {job['title']}
+Job description: {(job.get('description') or '')[:2000]}
 """
     response = _chat_with_retry(
         messages=[{"role": "user", "content": prompt}],
@@ -151,7 +388,8 @@ Job description: {job.get('description', '')[:2000]}
 
 
 def store_tailored_cv(job_id, content):
-    key = f"tailored-cvs/{job_id}.txt"
+    # job_id contains a colon (e.g. "remotive:12345") — safe as an S3 key component
+    key = f"tailored-cvs/{job_id.replace(':', '_')}.txt"
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=content.encode("utf-8"))
     url = s3.generate_presigned_url(
         "get_object",
@@ -168,8 +406,10 @@ def send_digest(matches, failed_count):
     if matches:
         body_lines.append("New job matches found:\n")
         for m in matches:
+            tier_label = TIER_LABELS.get(m["match_tier"], m["match_tier"])
             body_lines.append(
                 f"- {m['title']} @ {m['company']} (score {m['score']}/10)\n"
+                f"  {tier_label}\n"
                 f"  {m['reasoning']}\n"
                 f"  Listing: {m['url']}\n"
                 f"  Tailored CV: {m['cv_key']}\n"
@@ -197,8 +437,8 @@ def handler(event, context):
     failed_count = 0
 
     for job in jobs:
-        job_id = str(job.get("id"))
-        if not job_id or already_seen(job_id):
+        job_id = job["id"]
+        if already_seen(job_id):
             continue
 
         try:
@@ -216,12 +456,13 @@ def handler(event, context):
                 tailored = tailor_cv(master_cv, job)
                 cv_key = store_tailored_cv(job_id, tailored)
                 matches.append({
-                    "title": job.get("title"),
-                    "company": job.get("company", {}).get("display_name", "Unknown"),
+                    "title": job["title"],
+                    "company": job["company"],
                     "score": result["match_score"],
                     "reasoning": result.get("reasoning", ""),
-                    "url": job.get("redirect_url", ""),
+                    "url": job["url"],
                     "cv_key": cv_key,
+                    "match_tier": job["match_tier"],
                 })
             except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
                 # Job was already scored and marked seen — a tailoring
