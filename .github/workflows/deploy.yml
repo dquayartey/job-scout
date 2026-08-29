@@ -33,6 +33,20 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      # Each run starts with empty local state, but the ECR repo may already
+      # exist in AWS from a previous run. If so, import it into state before
+      # apply tries (and fails) to create it again.
+      - name: Import existing ECR repository into state
+        run: |
+          if aws ecr describe-repositories \
+              --repository-names "${{ env.ECR_REPOSITORY }}" \
+              --region "${{ env.AWS_REGION }}" >/dev/null 2>&1; then
+            echo "Repository exists in AWS — importing into Terraform state"
+            terraform import aws_ecr_repository.job_scout "${{ env.ECR_REPOSITORY }}"
+          else
+            echo "Repository does not exist yet — Terraform will create it"
+          fi
+
       - name: Terraform Apply - ECR only (bootstrap)
         run: |
           terraform apply -auto-approve \
