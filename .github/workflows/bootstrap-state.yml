@@ -71,16 +71,21 @@ jobs:
             local addr="$1"
             local id="$2"
             if terraform state show "$addr" >/dev/null 2>&1; then
-              echo "$addr already in state, skipping."
+              echo "✓ $addr already in state, skipping."
             else
               echo "Importing $addr ..."
-              terraform import -input=false \
+              if terraform import -input=false \
+                -var="image_tag=bootstrap-placeholder" \
                 -var="gemini_api_key=${{ secrets.GEMINI_API_KEY }}" \
                 -var="adzuna_app_id=${{ secrets.ADZUNA_APP_ID }}" \
                 -var="adzuna_app_key=${{ secrets.ADZUNA_APP_KEY }}" \
                 -var="ses_sender=${{ secrets.SES_SENDER }}" \
                 -var="ses_recipient=${{ secrets.SES_RECIPIENT }}" \
-                "$addr" "$id" || echo "  -> import failed or resource doesn't exist yet, continuing"
+                "$addr" "$id"; then
+                echo "✓ Imported $addr"
+              else
+                echo "✗ FAILED to import $addr (may not exist in AWS, or a real error — check the log above)"
+              fi
             fi
           }
 
@@ -93,6 +98,7 @@ jobs:
       - name: Show what's left to reconcile
         run: |
           terraform plan \
+            -var="image_tag=bootstrap-placeholder" \
             -var="gemini_api_key=${{ secrets.GEMINI_API_KEY }}" \
             -var="adzuna_app_id=${{ secrets.ADZUNA_APP_ID }}" \
             -var="adzuna_app_key=${{ secrets.ADZUNA_APP_KEY }}" \
