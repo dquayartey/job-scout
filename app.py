@@ -28,7 +28,7 @@ JOB_COUNTRY = os.environ.get("JOB_COUNTRY", "gb")  # Adzuna country code
 MATCH_THRESHOLD = int(os.environ.get("MATCH_THRESHOLD", "7"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "20"))
 SEEN_TTL_DAYS = int(os.environ.get("SEEN_TTL_DAYS", "30"))
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # Retries for transient errors (rate limit / connection / timeout),
 # on top of whatever the SDK does internally
