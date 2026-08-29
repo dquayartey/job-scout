@@ -805,12 +805,14 @@ def handler(event, context):
 
         # Partition every job currently returned by the sources into three
         # buckets: needs scoring (never seen, or seen but not yet matched
-        # and under MAX_SCORE_ATTEMPTS), needs a re-notify today (already
-        # matched, under NOTIFY_DAYS_REQUIRED distinct notify dates, not
-        # already notified today), or fully done (should_skip == True, or
-        # already matched *and* already notified today so there's nothing
-        # to do for it this run).
+        # and under MAX_SCORE_ATTEMPTS), needs tailoring (matched — either
+        # just now or on an earlier run — but has no stored cv_key yet,
+        # whether because it's brand new or because a previous tailoring
+        # attempt failed), or needs a plain re-notify (matched AND already
+        # has a cv_key, so no Groq call is needed at all). Anything past
+        # NOTIFY_DAYS_REQUIRED distinct notify dates is fully retired.
         to_score = []
+        needs_tailoring = []  # [(job, score, reasoning), ...] — always retried until it succeeds
         to_renotify = []  # [(job, item), ...] — no Groq calls needed, reuses stored cv_key
         skipped_max_attempts = 0
         skipped_fully_seen = 0
@@ -824,14 +826,23 @@ def handler(event, context):
                 if len(item.get("match_dates", [])) >= NOTIFY_DAYS_REQUIRED:
                     skipped_fully_seen += 1
                     continue
-                # Still within the notify window — always re-notify on
-                # invocation, even if this Lambda already ran (and emailed
-                # about this job) earlier today. record_notify_day() dedupes
-                # by calendar date, so multiple same-day invocations don't
-                # advance the retirement count faster than once per day;
-                # they just mean the candidate gets emailed more than once
-                # that day, which is fine.
-                to_renotify.append((job, item))
+                if not item.get("cv_key"):
+                    # Matched (this run or a previous one) but never
+                    # successfully tailored — e.g. a prior tailoring batch
+                    # hit a Groq rate limit. Keep retrying every run until
+                    # it succeeds, using the score/reasoning from whenever
+                    # it originally matched.
+                    needs_tailoring.append((job, item.get("last_score"), item.get("last_reasoning")))
+                else:
+                    # Still within the notify window — always re-notify on
+                    # invocation, even if this Lambda already ran (and
+                    # emailed about this job) earlier today.
+                    # record_notify_day() dedupes by calendar date, so
+                    # multiple same-day invocations don't advance the
+                    # retirement count faster than once per day; they just
+                    # mean the candidate gets emailed more than once that
+                    # day, which is fine.
+                    to_renotify.append((job, item))
                 continue
             if item.get("attempts", 0) >= MAX_SCORE_ATTEMPTS:
                 skipped_max_attempts += 1
@@ -839,7 +850,6 @@ def handler(event, context):
             to_score.append(job)
 
         matches = []
-        newly_matched = []  # [(job, score, reasoning), ...] — tailored in a separate pass below
         failed_count = 0
         no_match_count = 0
 
@@ -868,7 +878,7 @@ def handler(event, context):
                         f"company={job['company']!r} score={score} attempt={attempts} "
                         f"reasoning={reasoning!r}"
                     )
-                    newly_matched.append((job, score, reasoning))
+                    needs_tailoring.append((job, score, reasoning))
                 else:
                     no_match_count += 1
                     logger.info(
@@ -879,15 +889,14 @@ def handler(event, context):
                         f"attempt={attempts}/{MAX_SCORE_ATTEMPTS} reasoning={reasoning!r}"
                     )
 
-        # Tailor newly-matched jobs' CVs in their own batches — this only
-        # ever runs once per job, the first day it crosses MATCH_THRESHOLD.
-        # A tailoring failure here means this job doesn't get a digest entry
-        # or a recorded notify day this run; since record_attempt already
-        # marked it matched, it'll simply be retried as a to_renotify
-        # candidate next run (it has no match_dates yet, so it isn't at risk
-        # of being retired early).
-        for i in range(0, len(newly_matched), TAILOR_BATCH_SIZE):
-            batch = newly_matched[i:i + TAILOR_BATCH_SIZE]
+        # Tailor every matched-but-untailored job in its own batches —
+        # covers both brand-new matches from this run and jobs matched on
+        # an earlier run whose tailoring previously failed. A failure here
+        # just leaves cv_key unset, so these same jobs land back in
+        # needs_tailoring next run too (should_skip won't retire a job
+        # with 0 match_dates, so nothing is lost, just delayed).
+        for i in range(0, len(needs_tailoring), TAILOR_BATCH_SIZE):
+            batch = needs_tailoring[i:i + TAILOR_BATCH_SIZE]
             jobs_only = [item[0] for item in batch]
             try:
                 tailored_map = tailor_cvs_batch(master_cv, jobs_only)
@@ -915,19 +924,13 @@ def handler(event, context):
                     "notify_day": notify_day,
                 })
 
-        # Re-notify jobs matched on an earlier run: no Groq calls at all —
-        # reuse the CV already tailored and stored the first time, just
-        # regenerate a fresh presigned URL (ExpiresIn is shorter than a job
-        # could stay eligible for) and log today as another notify date.
+        # Re-notify jobs matched AND already tailored on an earlier run: no
+        # Groq calls at all — reuse the CV already stored, just regenerate
+        # a fresh presigned URL (ExpiresIn is shorter than a job could stay
+        # eligible for) and log today as another notify date.
         for job, item in to_renotify:
-            cv_key = item.get("cv_key")
-            if not cv_key:
-                # Shouldn't happen (a matched job always gets a cv_key on
-                # the day it's tailored), but don't crash the run over it.
-                logger.error(f"Matched job {job['id']} has no stored cv_key — skipping re-notify")
-                continue
-            cv_url = _presigned_cv_url(cv_key)
-            notify_day = record_notify_day(job["id"], cv_key)
+            cv_url = _presigned_cv_url(item["cv_key"])
+            notify_day = record_notify_day(job["id"], item["cv_key"])
             matches.append({
                 "title": job["title"],
                 "company": job["company"],
