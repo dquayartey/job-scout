@@ -29,6 +29,7 @@ MATCH_THRESHOLD = int(os.environ.get("MATCH_THRESHOLD", "7"))
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "20"))
 SEEN_TTL_DAYS = int(os.environ.get("SEEN_TTL_DAYS", "30"))
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+CV_LINK_EXPIRY_S = int(os.environ.get("CV_LINK_EXPIRY_S", str(7 * 24 * 3600)))  # 7 days
 
 # Retries for transient errors (rate limit / connection / timeout),
 # on top of whatever the SDK does internally
@@ -152,7 +153,12 @@ Job description: {job.get('description', '')[:2000]}
 def store_tailored_cv(job_id, content):
     key = f"tailored-cvs/{job_id}.txt"
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=content.encode("utf-8"))
-    return key
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=CV_LINK_EXPIRY_S,
+    )
+    return url
 
 
 def send_digest(matches, failed_count):
@@ -166,7 +172,7 @@ def send_digest(matches, failed_count):
                 f"- {m['title']} @ {m['company']} (score {m['score']}/10)\n"
                 f"  {m['reasoning']}\n"
                 f"  Listing: {m['url']}\n"
-                f"  Tailored CV: s3://{S3_BUCKET}/{m['cv_key']}\n"
+                f"  Tailored CV: {m['cv_key']}\n"
             )
     if failed_count:
         body_lines.append(
