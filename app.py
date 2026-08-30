@@ -509,12 +509,17 @@ def record_attempt(job_id, matched, score=None, reasoning=None):
     Returns the new attempt count (used for logging)."""
     item = _get_seen_item(job_id) or {}
     attempts = item.get("attempts", 0) + 1
+    
+    # Resolve score and reasoning safely without saving Python None/NULL
+    resolved_score = score if score is not None else item.get("last_score")
+    resolved_reasoning = reasoning if reasoning is not None else item.get("last_reasoning")
+
     ddb.put_item(Item={
         "job_id": job_id,
         "attempts": attempts,
         "matched": matched or item.get("matched", False),
-        "last_score": score if score is not None else item.get("last_score"),
-        "last_reasoning": reasoning if reasoning is not None else item.get("last_reasoning"),
+        "last_score": resolved_score if resolved_score is not None else "N/A",
+        "last_reasoning": resolved_reasoning if resolved_reasoning is not None else "No reasoning recorded.",
         "match_dates": item.get("match_dates", []),
         "cv_key": item.get("cv_key"),
         "seen_at": int(time.time()),
@@ -905,42 +910,57 @@ def handler(event, context):
                 failed_count += len(batch)
                 continue
 
-            for job, score, reasoning in batch:
-                tailored_text = tailored_map.get(job["id"])
-                if not tailored_text:
-                    logger.error(f"CV tailoring produced no output for job {job['id']}")
-                    failed_count += 1
-                    continue
-                cv_key, cv_url = store_tailored_cv(job["id"], tailored_text)
-                notify_day = record_notify_day(job["id"], cv_key)
-                matches.append({
-                    "title": job["title"],
-                    "company": job["company"],
-                    "score": score,
-                    "reasoning": reasoning,
-                    "url": job["url"],
-                    "cv_url": cv_url,
-                    "match_tier": job["match_tier"],
-                    "notify_day": notify_day,
-                })
+            # FIND THIS LOOP IN handler():
+for job, score, reasoning in batch:
+    tailored_text = tailored_map.get(job["id"])
+    if not tailored_text:
+        logger.error(f"CV tailoring produced no output for job {job['id']}")
+        failed_count += 1
+        continue
+    cv_key, cv_url = store_tailored_cv(job["id"], tailored_text)
+    notify_day = record_notify_day(job["id"], cv_key)
+    
+    # --- ADD FALLBACKS HERE ---
+    safe_score = score if score is not None else "N/A"
+    safe_reasoning = reasoning if reasoning else "No reasoning recorded."
+
+    matches.append({
+        "title": job["title"],
+        "company": job["company"],
+        "score": safe_score,              # Changed from score
+        "reasoning": safe_reasoning,      # Changed from reasoning
+        "url": job["url"],
+        "cv_url": cv_url,
+        "match_tier": job["match_tier"],
+        "notify_day": notify_day,
+    })
 
         # Re-notify jobs matched AND already tailored on an earlier run: no
         # Groq calls at all — reuse the CV already stored, just regenerate
         # a fresh presigned URL (ExpiresIn is shorter than a job could stay
         # eligible for) and log today as another notify date.
-        for job, item in to_renotify:
-            cv_url = _presigned_cv_url(item["cv_key"])
-            notify_day = record_notify_day(job["id"], item["cv_key"])
-            matches.append({
-                "title": job["title"],
-                "company": job["company"],
-                "score": item.get("last_score"),
-                "reasoning": item.get("last_reasoning"),
-                "url": job["url"],
-                "cv_url": cv_url,
-                "match_tier": job["match_tier"],
-                "notify_day": notify_day,
-            })
+    # FIND THIS LOOP IN handler():
+for job, item in to_renotify:
+    cv_url = _presigned_cv_url(item["cv_key"])
+    notify_day = record_notify_day(job["id"], item["cv_key"])
+    
+    # --- ADD FALLBACKS HERE ---
+    raw_score = item.get("last_score") if item.get("last_score") is not None else item.get("score")
+    raw_reasoning = item.get("last_reasoning") or item.get("reasoning")
+    
+    safe_score = raw_score if raw_score is not None else "N/A"
+    safe_reasoning = raw_reasoning if raw_reasoning else "No reasoning recorded."
+
+    matches.append({
+        "title": job["title"],
+        "company": job["company"],
+        "score": safe_score,              # Changed from item.get("last_score")
+        "reasoning": safe_reasoning,      # Changed from item.get("last_reasoning")
+        "url": job["url"],
+        "cv_url": cv_url,
+        "match_tier": job["match_tier"],
+        "notify_day": notify_day,
+    })
 
         send_digest(matches, failed_count)
 
